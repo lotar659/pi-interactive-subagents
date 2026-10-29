@@ -10,7 +10,9 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { unlinkSync, writeFileSync } from "node:fs";
+import { pollForExit } from "../../pi-extension/subagents/tmux.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -26,6 +28,7 @@ import {
   readScreen,
   readScreenAsync,
   closeSurface,
+  shellEscape,
   sleep,
   uniqueId,
   trackTempFile,
@@ -191,6 +194,120 @@ for (const backend of backends) {
       // Clean up
       try {
         unlinkSync(filePath);
+      } catch {}
+    });
+
+    // ── Completion signal ──
+    //
+    // Regression: completion used to rely only on the on-screen sentinel
+    // `__SUBAGENT_DONE_<code>__`. tmux wraps rows to the pane width, so in a
+    // pane narrower than the sentinel (19 columns) the marker was split across
+    // two captured rows and never matched — pollForExit() then looped forever,
+    // the pane stayed open and the orchestrator never got the result.
+
+    it("detects completion through the exit sidecar in a pane too narrow for the sentinel", async () => {
+      const surface = createTrackedSurface(env, "narrow-sidecar");
+      await sleep(1000);
+
+      // 12 columns: `__SUBAGENT_DONE_0__` cannot fit on one row.
+      execFileSync("tmux", ["resize-pane", "-t", surface, "-x", "12"], { encoding: "utf8" });
+      await sleep(300);
+
+      const marker = uniqueId();
+      const exitFile = `/tmp/pi-exit-sidecar-${marker}.exit`;
+      // Mirror the real launch script: the sentinel lives in a script FILE, so
+      // it only reaches the screen as output (never as echoed input).
+      const scriptPath = `/tmp/pi-exit-sidecar-${marker}.sh`;
+      writeFileSync(
+        scriptPath,
+        `printf '{"exitCode":%s}' 0 > ${shellEscape(`${exitFile}.tmp`)} && ` +
+          `mv -f ${shellEscape(`${exitFile}.tmp`)} ${shellEscape(exitFile)}\n` +
+          `echo '__SUBAGENT_DONE_'$?'__'\n`,
+        { mode: 0o755 },
+      );
+      trackTempFile(env, scriptPath);
+      sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: 200,
+        exitFile,
+      });
+
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    });
+
+    it("joins wrapped rows so the on-screen sentinel still works at 12 columns", async () => {
+      const surface = createTrackedSurface(env, "narrow-sentinel");
+      await sleep(1000);
+
+      execFileSync("tmux", ["resize-pane", "-t", surface, "-x", "12"], { encoding: "utf8" });
+      await sleep(300);
+
+      // No sidecar: this exercises the screen fallback alone.
+      const marker = uniqueId();
+      const scriptPath = `/tmp/pi-narrow-sentinel-${marker}.sh`;
+      writeFileSync(scriptPath, `echo '__SUBAGENT_DONE_7__'\n`, { mode: 0o755 });
+      trackTempFile(env, scriptPath);
+      sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: 200,
+      });
+
+      // `-J` on capture-pane re-joins the wrapped marker; without it this
+      // poll never resolves.
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 7 });
+    });
+
+    it("carries the child exit code from the sidecar in a narrow pane", async () => {
+      const surface = createTrackedSurface(env, "narrow-sidecar-code");
+      await sleep(1000);
+
+      execFileSync("tmux", ["resize-pane", "-t", surface, "-x", "12"], { encoding: "utf8" });
+      await sleep(300);
+
+      const marker = uniqueId();
+      const exitFile = `/tmp/pi-exit-sidecar-${marker}.exit`;
+      sendCommand(
+        surface,
+        `printf '{"exitCode":%s}' 137 > ${exitFile}.tmp && mv -f ${exitFile}.tmp ${exitFile}`,
+      );
+
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: 200,
+        exitFile,
+      });
+
+      assert.deepEqual(result, { reason: "done", exitCode: 137 });
+    });
+
+    it("stops polling with an error once the pane is gone and no sidecar was written", async () => {
+      const surface = createTrackedSurface(env, "vanished-pane");
+      await sleep(1000);
+
+      const marker = uniqueId();
+      const exitFile = `/tmp/pi-exit-sidecar-${marker}.exit`;
+      const sessionFile = `/tmp/pi-exit-sidecar-${marker}.jsonl`;
+
+      const polling = pollForExit(surface, new AbortController().signal, {
+        interval: 5,
+        exitFile,
+        sessionFile,
+      });
+
+      // Destroy the pane while the child is still "running".
+      await sleep(50);
+      closeSurface(surface);
+      untrackSurface(env, surface);
+
+      const result = await polling;
+      assert.equal(result.reason, "error");
+      assert.match(result.errorMessage ?? "", /unreadable/);
+
+      // A sidecar written after the pane died still wins on the next check.
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ exitCode: 0 }));
+      try {
+        unlinkSync(`${sessionFile}.exit`);
       } catch {}
     });
   });

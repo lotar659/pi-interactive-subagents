@@ -11,6 +11,13 @@
  * signal the parent's watcher picks up, parks the session in a "waiting" state
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
+ *
+ * A provider/connection error keeps the session OPEN too. When auto-retry is
+ * exhausted the turn ends with `stopReason: "error"`, which pi itself treats as
+ * a normal (recoverable) end of turn in an interactive session. Auto-exit is
+ * therefore suppressed for that turn as well: the subagent parks in "waiting",
+ * writes a `${sessionFile}.attention` signal, and the parent can steer a retry
+ * into the live session instead of resuming it from a cold start.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
@@ -55,11 +62,6 @@ export function shouldAutoExitOnAgentEnd(
   // Manual input should not strand an auto-exit subagent. If the latest agent
   // turn completed normally, close the session. Escape/abort still leaves it
   // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
@@ -70,6 +72,40 @@ export function shouldAutoExitOnAgentEnd(
   }
 
   return true;
+}
+
+export type AgentEndAction =
+  /** Close the pane: the turn is over and the parent gets the result. */
+  | "shutdown"
+  /** Keep the session open (park in "waiting") for a later turn. */
+  | "park";
+
+/**
+ * Decide what an auto-exit subagent does when a turn ends.
+ *
+ * `park` for every case where the run is not actually finished:
+ *  - awaitingAnswer: an ask_question is pending the orchestrator's reply;
+ *  - hasPendingChildren: this subagent spawned its own children and is waiting
+ *    for their results (exiting now would strand them);
+ *  - a provider/connection error on the last turn (auto-retry exhausted). pi
+ *    itself leaves an interactive session open after such an error, with the
+ *    error in the transcript and the next message continuing the conversation —
+ *    a subagent must behave the same way instead of closing itself. The parent
+ *    is told once via the `.attention` sidecar and can steer a retry in.
+ */
+export function resolveAgentEndAction(params: {
+  autoExit: boolean;
+  awaitingAnswer: boolean;
+  hasPendingChildren: boolean;
+  messages: any[] | undefined;
+}): AgentEndAction {
+  const turnOver =
+    params.autoExit &&
+    !params.awaitingAnswer &&
+    !params.hasPendingChildren &&
+    shouldAutoExitOnAgentEnd(false, params.messages);
+  if (!turnOver) return "park";
+  return findLatestAssistantError(params.messages) ? "park" : "shutdown";
 }
 
 export interface SubagentErrorInfo {
@@ -225,55 +261,51 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    // Never shut down while this session still has work in flight:
-    //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
-    //  - runningChildrenCount(): this subagent spawned its own children and is
-    //    waiting for their results (delivered as steered turns). Exiting now
-    //    would strand those children and drop their results.
-    // In both cases the session parks as `waiting` and resumes when the next
-    // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
-    const shouldExit =
-      !awaitingAnswer &&
-      !hasPendingChildren &&
-      autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const action = resolveAgentEndAction({
+      autoExit,
+      awaitingAnswer,
+      hasPendingChildren,
+      messages,
+    });
 
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
-
+    if (action === "shutdown") {
       recorder.agentEndDone();
       ctx.shutdown();
       return;
     }
 
-    recorder.agentEndWaiting();
+    // Parked: keep the session (and its pane) open for a later turn. When the
+    // reason is a provider/connection error, drop an `.attention` sidecar so the
+    // parent's watcher learns about it once and can steer a retry into this live
+    // session — the same thing a human does in a normal pi session after an
+    // error. Auto-exit is still decided per turn, so a later turn that completes
+    // cleanly closes the session normally.
     if (autoExit) {
+      const errorInfo = findLatestAssistantError(messages);
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (errorInfo && sessionFile) {
+        try {
+          writeFileSync(
+            `${sessionFile}.attention`,
+            JSON.stringify({
+              type: "provider-error",
+              errorMessage: errorInfo.errorMessage,
+              stopReason: errorInfo.stopReason,
+            }),
+          );
+        } catch {
+          // Best effort — without the sidecar the parent still sees the run
+          // sitting in the widget's "waiting" phase and can steer it.
+        }
+      }
+
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+
+    recorder.agentEndWaiting();
   });
 
   pi.on("turn_start", (event) => {

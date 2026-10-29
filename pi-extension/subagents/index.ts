@@ -105,7 +105,11 @@ const SubagentParams = Type.Object({
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  // LOCAL PATCH: per-spawn model overrides are disabled. An agent's model comes
+  // only from its own frontmatter; a parent silently overriding it (e.g. to an
+  // expensive model for a trivial task) is not allowed. To re-enable, uncomment
+  // the line below and restore `params.model ??` in launchSubagent().
+  // model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -558,15 +562,17 @@ function resolveResultPresentation(
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
 
   if (result.errorMessage) {
-    // Auto-retry exhausted or other agent-loop error. The subagent did not
-    // produce a usable result — surface the underlying provider/network
-    // failure so the orchestrator can decide whether to retry, resume, or
-    // change approach instead of silently treating the run as completed.
+    // The run did not produce a usable result. Two sources: a legacy/stale
+    // `.exit` sidecar carrying a provider error (live provider errors no longer
+    // end the run — the subagent parks and is reported via
+    // `${sessionFile}.attention`), or a run whose completion could not be
+    // observed at all (pane destroyed, multiplexer restarted). Surface the
+    // underlying reason so the orchestrator can decide whether to retry, resume,
+    // or change approach instead of silently treating the run as completed.
     return (
-      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)}.\n\n` +
       `Error: ${result.errorMessage}\n\n` +
-      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `The subagent did not produce a usable result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_message.${sessionRef}`
     );
   }
@@ -618,6 +624,8 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** Run-scoped exit sidecar: the authoritative completion signal for pi runs. */
+  exitFile?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1141,6 +1149,10 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  deliverPendingAttention,
+  subagentExitFile,
+  exitSidecarShellSnippet,
+  clearExitSidecar,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1160,6 +1172,51 @@ function startWidgetRefresh() {
 }
 
 /**
+ * Run-scoped exit sidecar path for one launch.
+ *
+ * Scoped by subagent id (not just by session file) so that resuming the same
+ * session — which reuses the session file — can never pick up a sidecar left
+ * behind by an earlier run, and two concurrent watchers of the same session
+ * cannot consume each other's completion signal.
+ */
+function subagentExitFile(sessionFile: string, id: string): string {
+  return `${sessionFile}.exit.${id}`;
+}
+
+/**
+ * Shell snippet that records a child's exit status in its exit sidecar.
+ *
+ * This is the authoritative completion signal for a pi subagent: the terminal
+ * sentinel `__SUBAGENT_DONE_<code>__` that follows it can be split across two
+ * captured rows in a narrow pane, or re-wrapped by a resize, and then never
+ * matches (see pollForExit in tmux.ts). The write is atomic (tmp + mv) so the
+ * parent can never read a half-written payload, and it runs in the pane's shell
+ * so it also fires when the child crashes or is killed rather than exiting
+ * cleanly.
+ *
+ * `codeVar` is the shell variable holding the child's status.
+ */
+function exitSidecarShellSnippet(sessionFile: string, id: string, codeVar: string): string {
+  const path = subagentExitFile(sessionFile, id);
+  return (
+    `printf '{"exitCode":%s}' "$${codeVar}" > ${shellEscape(`${path}.tmp`)}` +
+    ` && mv -f ${shellEscape(`${path}.tmp`)} ${shellEscape(path)}`
+  );
+}
+
+/**
+ * Remove a stale sidecar from an interrupted earlier run before launching.
+ * Best effort: a missing file is the normal case.
+ */
+function clearExitSidecar(exitFile: string): void {
+  for (const path of [exitFile, `${exitFile}.tmp`]) {
+    try {
+      unlinkSync(path);
+    } catch {}
+  }
+}
+
+/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -1174,7 +1231,9 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  // LOCAL PATCH: no per-spawn model override — the agent's frontmatter model is
+  // authoritative (`model` was removed from the `subagent` tool schema).
+  const effectiveModel = agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1414,7 +1473,11 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const exitFile = subagentExitFile(subagentSessionFile, id);
+  clearExitSidecar(exitFile);
+  const command =
+    `${piCommand}; piExit=$?; ${exitSidecarShellSnippet(subagentSessionFile, id, "piExit")}; ` +
+    `echo '__SUBAGENT_DONE_'$piExit'__'`;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1442,6 +1505,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    exitFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1521,6 +1585,57 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Detect a `.attention` signal from a still-running subagent whose last turn
+ * died on a provider/connection error (auto-retry exhausted). The run is NOT
+ * over: the child parks like a normal pi session after an error — still open,
+ * still in its pane — so the orchestrator is notified once and can steer a
+ * retry into the live session instead of resuming it from a cold start. The
+ * file is deleted after delivery, so a run that fails again notifies again.
+ */
+function deliverPendingAttention(running: RunningSubagent): void {
+  const attentionFile = `${running.sessionFile}.attention`;
+  let payload: any = null;
+  try {
+    if (!existsSync(attentionFile)) return;
+    payload = JSON.parse(readFileSync(attentionFile, "utf-8"));
+  } catch {
+    // Malformed/partway-written file — drop it and move on.
+  }
+  try {
+    unlinkSync(attentionFile);
+  } catch {}
+  const errorMessage =
+    typeof payload?.errorMessage === "string" ? payload.errorMessage.trim() : "";
+  if (!errorMessage) return;
+
+  const name = running.name; // unique per session (deduped at spawn) — targets the retry
+  const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
+  const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
+  const retryHint =
+    `\n\nThe subagent is still open and waiting — its run did NOT close and nothing is lost. ` +
+    `Reply with subagent_message({ name: "${name}", message: "Continue." }) to let it retry, ` +
+    `or leave it parked.`;
+
+  latestPi?.sendMessage(
+    {
+      customType: "subagent_attention",
+      content:
+        `Sub-agent "${name}" hit a provider/connection error after ${formatElapsed(elapsed)} ` +
+        `and is parked waiting — the session is still open.\n\nError: ${errorMessage}` +
+        retryHint,
+      display: true,
+      details: {
+        name,
+        agent: running.agent,
+        errorMessage,
+        ...(sessionId ? { sessionId } : {}),
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1531,10 +1646,12 @@ async function watchSubagent(
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
+      exitFile: running.exitFile,
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
+        deliverPendingAttention(running);
       },
     });
 
@@ -1570,7 +1687,12 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      // The pane may already be gone (user closed it, tmux restarted). The run
+      // still completed — a failed kill-pane must not turn a delivered result
+      // into a reported failure.
+      try {
+        closeSurface(surface);
+      } catch {}
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1598,7 +1720,9 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    try {
+      closeSurface(surface);
+    } catch {}
     runningSubagents.delete(running.id);
 
     return {
@@ -2212,7 +2336,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const exitFile = subagentExitFile(sessionPath, id);
+        clearExitSidecar(exitFile);
+        const command =
+          `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; piExit=$?; ` +
+          `${exitSidecarShellSnippet(sessionPath, id, "piExit")}; ` +
+          `echo '__SUBAGENT_DONE_'$piExit'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2244,6 +2373,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          exitFile,
           interactive,
           statusState: createStatusState({
             source: "pi",
@@ -2376,7 +2506,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // like the in-process extension. Failure: surface the failure reason.
         let header: string;
         if (failed) {
-          const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
+          const reason = errorMessage ? "failed" : `failed (exit ${exitCode})`;
           header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
         } else {
           const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
@@ -2400,14 +2530,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const rawContent = typeof message.content === "string" ? message.content : "";
 
-        // Clean summary (remove follow-up ref and leading label for display)
+        // Clean summary (remove follow-up ref and the leading label for display).
+        // One tolerant pattern instead of exact strings per outcome, so a
+        // wording change cannot leave the header duplicated inside the box.
         const summary = rawContent
           .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
             new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" (?:completed|failed)[^\\n]*\\n\\n`,
             ),
             "",
           );
@@ -2483,6 +2613,50 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
+  // ── subagent_attention message renderer ──
+  pi.registerMessageRenderer("subagent_attention", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+        const bgFn = (text: string) => theme.bg("toolErrorBg", text);
+
+        const icon = theme.fg("warning", "!");
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— provider error, still running")}`;
+
+        const contentLines = [header];
+        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
+
+        if (options.expanded) {
+          if (errorMessage) {
+            contentLines.push("");
+            for (const line of errorMessage.split("\n")) {
+              contentLines.push(theme.fg("error", line.slice(0, width - 6)));
+            }
+          }
+          contentLines.push("");
+          contentLines.push(
+            theme.fg(
+              "dim",
+              `Retry: subagent_message({ name: "${name}", message: "Continue." })`,
+            ),
+          );
+        } else {
+          const preview = errorMessage.split("\n")[0].slice(0, width - 10);
+          if (preview) contentLines.push(theme.fg("dim", preview));
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+
+        const box = new Box(1, 1, bgFn);
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },

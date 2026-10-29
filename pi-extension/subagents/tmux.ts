@@ -204,12 +204,17 @@ export function sendLongCommand(
 
 /**
  * Read the screen contents of a pane (sync).
+ *
+ * `-J` joins rows that tmux wrapped because they did not fit the pane width.
+ * Without it a narrow pane (< 19 columns) splits short markers such as
+ * `__SUBAGENT_DONE_0__` across two captured rows, which is invisible to any
+ * whole-string match. See pollForExit().
  */
 export function readScreen(surface: string, lines = 50): string {
   requireTmux();
   return execFileSync(
     "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    ["capture-pane", "-p", "-J", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     {
       encoding: "utf8",
     },
@@ -223,7 +228,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   requireTmux();
   const { stdout } = await execFileAsync(
     "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    ["capture-pane", "-p", "-J", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
   return stdout;
@@ -249,32 +254,109 @@ export interface PollResult {
   errorMessage?: string;
 }
 
+function parseSidecarExitCode(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.trunc(value));
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    return Number.parseInt(value.trim(), 10);
+  }
+  return null;
+}
+
 /**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
+ * Interpret an `.exit` sidecar payload.
+ *
+ * Two writers exist:
+ *  - the launch script, which records the child's raw exit status as
+ *    `{"exitCode":N}` when the process ends (clean, crashed or killed), and
+ *  - the legacy error path in subagent-done.ts, which wrote
+ *    `{"type":"error",…}`. A provider/connection error now keeps the session
+ *    open instead (see `${sessionFile}.attention`), so that decode stays as a
+ *    defensive path for a sidecar left behind by an older child.
+ *
+ * `exitCode` is honoured for both shapes: reporting a crashed child as a clean
+ * `exitCode: 0` would let the parent present a half-finished transcript as a
+ * completed result.
  *
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
+ * open and signals the parent via a separate `.ask` file (see
+ * deliverPendingQuestion).
  */
 function interpretExitSidecar(data: any): PollResult {
+  const exitCode = parseSidecarExitCode(data?.exitCode) ?? 0;
   if (data?.type === "error") {
     const errorMessage =
       typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
         ? data.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
+    return { reason: "error", exitCode: exitCode || 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  return { reason: "done", exitCode };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+/**
+ * Sidecar paths to consult for a finished run, most specific first: the
+ * run-scoped file written by this launch, then the legacy shared path.
+ */
+function exitSidecarPaths(options: { sessionFile?: string; exitFile?: string }): string[] {
+  const paths: string[] = [];
+  if (options.exitFile) paths.push(options.exitFile);
+  if (options.sessionFile) paths.push(`${options.sessionFile}.exit`);
+  return paths;
+}
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
+ * Read and consume the first exit sidecar that exists. A sidecar is removed
+ * only after it parses, so a partially written file is retried on the next
+ * tick instead of being lost.
+ */
+function readExitSidecar(options: { sessionFile?: string; exitFile?: string }): PollResult | null {
+  for (const path of exitSidecarPaths(options)) {
+    try {
+      if (!existsSync(path)) continue;
+      const raw = readFileSync(path, "utf-8");
+      let data: any = null;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      rmSync(path, { force: true });
+      return interpretExitSidecar(data);
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar, readExitSidecar };
+
+/**
+ * Unreadable-surface ticks tolerated before the run is reported as lost.
+ * `capture-pane` only fails when the pane is gone (closed by the user, tmux
+ * server restarted) or the multiplexer itself is unusable, so a run of these
+ * means the completion signal can never arrive on the screen.
+ */
+const MAX_CAPTURE_FAILURES = 15;
+
+/**
+ * Poll until the subagent exits.
+ *
+ * The authoritative signal is the exit sidecar: the launch script writes
+ * `{"exitCode":N}` into `exitFile` (run-scoped) after the child process ends,
+ * whatever the reason. It is immune to everything the fallbacks are not:
+ * pane width, wrapped/reflowed rows, scrollback and a destroyed pane.
+ *
+ * Fallbacks, in order:
+ *  - a legacy `${sessionFile}.exit` sidecar written by an older error path,
+ *  - the Claude sentinel file (written by the plugin Stop hook),
+ *  - the terminal sentinel `__SUBAGENT_DONE_<code>__` on screen, which is
+ *    fragile: a pane narrower than 19 columns splits the marker across two
+ *    rows, and a resize re-wraps rows that were already printed.
+ *
+ * A `.attention` sidecar (provider error with the session still open) is
+ * deliberately NOT an exit: the run keeps polling, so the orchestrator can
+ * steer a retry into the live session.
  */
 export async function pollForExit(
   surface: string,
@@ -282,28 +364,23 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
+    /** Run-scoped exit sidecar written by the launch script. */
+    exitFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let captureFailures = 0;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
+    // Fast path: the child process ended and its launch script recorded the code.
+    const sidecar = readExitSidecar(options);
+    if (sidecar) return sidecar;
 
     // Check Claude sentinel file (written by plugin Stop hook)
     if (options.sentinelFile) {
@@ -317,21 +394,25 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      captureFailures = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+      // Surface may have been destroyed — the sidecar may have landed meanwhile.
+      const lateSidecar = readExitSidecar(options);
+      if (lateSidecar) return lateSidecar;
+      captureFailures += 1;
+      if (captureFailures >= MAX_CAPTURE_FAILURES) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage:
+            `Terminal surface ${surface} became unreadable ${MAX_CAPTURE_FAILURES} ticks in a row ` +
+            `(pane closed or tmux restarted) and no exit sidecar was written. ` +
+            `The sub-agent process may have been killed with its pane.`,
+        };
       }
     }
 

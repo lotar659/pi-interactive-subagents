@@ -52,6 +52,7 @@ import {
 import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
+  resolveAgentEndAction,
   findLatestAssistantError,
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
@@ -1497,11 +1498,89 @@ describe("subagent-done.ts", () => {
     });
 
     it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
+      // The turn is over, so auto-exit is eligible — but resolveAgentEndAction
+      // parks instead of shutting down (see the resolveAgentEndAction suite).
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+  });
+
+  describe("resolveAgentEndAction", () => {
+    const normal = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+    const failed = [{ role: "assistant", stopReason: "error", errorMessage: "connection reset" }];
+
+    it("shuts down after a clean turn", () => {
+      assert.equal(
+        resolveAgentEndAction({
+          autoExit: true,
+          awaitingAnswer: false,
+          hasPendingChildren: false,
+          messages: normal,
+        }),
+        "shutdown",
+      );
+    });
+
+    it("parks on a provider/connection error instead of closing the run", () => {
+      // Behave like a normal pi session: the error stays in the transcript and
+      // the session stays open so the parent can steer a retry into it.
+      assert.equal(
+        resolveAgentEndAction({
+          autoExit: true,
+          awaitingAnswer: false,
+          hasPendingChildren: false,
+          messages: failed,
+        }),
+        "park",
+      );
+    });
+
+    it("parks while an ask_question is pending", () => {
+      assert.equal(
+        resolveAgentEndAction({
+          autoExit: true,
+          awaitingAnswer: true,
+          hasPendingChildren: false,
+          messages: normal,
+        }),
+        "park",
+      );
+    });
+
+    it("parks while child subagents are still running", () => {
+      assert.equal(
+        resolveAgentEndAction({
+          autoExit: true,
+          awaitingAnswer: false,
+          hasPendingChildren: true,
+          messages: normal,
+        }),
+        "park",
+      );
+    });
+
+    it("parks after an abort", () => {
+      assert.equal(
+        resolveAgentEndAction({
+          autoExit: true,
+          awaitingAnswer: false,
+          hasPendingChildren: false,
+          messages: [{ role: "assistant", stopReason: "aborted" }],
+        }),
+        "park",
+      );
+    });
+
+    it("parks for interactive subagents (no auto-exit)", () => {
+      assert.equal(
+        resolveAgentEndAction({
+          autoExit: false,
+          awaitingAnswer: false,
+          hasPendingChildren: false,
+          messages: normal,
+        }),
+        "park",
+      );
     });
   });
 
@@ -1786,6 +1865,114 @@ describe("tmux.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
+
+  it("propagates the exit code the launch script recorded", () => {
+    // The launch script writes {"exitCode":N} after the child ends, whatever the
+    // reason. A crashed or killed child must not be reported as a clean run.
+    assert.deepEqual(interpretExitSidecar({ exitCode: 0 }), { reason: "done", exitCode: 0 });
+    assert.deepEqual(interpretExitSidecar({ exitCode: 137 }), { reason: "done", exitCode: 137 });
+    assert.deepEqual(interpretExitSidecar({ exitCode: "130" }), { reason: "done", exitCode: 130 });
+    assert.deepEqual(interpretExitSidecar({ exitCode: 1.7 }), { reason: "done", exitCode: 1 });
+  });
+
+  it("keeps a non-zero exit code on the legacy error payload", () => {
+    assert.equal(interpretExitSidecar({ type: "error", exitCode: 3 }).exitCode, 3);
+  });
+});
+
+describe("tmux.ts readExitSidecar", () => {
+  const { readExitSidecar } = __pollForExitTest__;
+
+  it("prefers the run-scoped sidecar and consumes it once", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-exit-sidecar-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const exitFile = `${sessionFile}.exit.run1`;
+      writeFileSync(exitFile, JSON.stringify({ exitCode: 0 }));
+
+      assert.deepEqual(readExitSidecar({ sessionFile, exitFile }), {
+        reason: "done",
+        exitCode: 0,
+      });
+      // Consumed: a second poll tick must not see it again.
+      assert.equal(readExitSidecar({ sessionFile, exitFile }), null);
+      assert.ok(!existsSync(exitFile));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a partially written sidecar and leaves it for the next tick", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-exit-sidecar-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const exitFile = `${sessionFile}.exit.run2`;
+      writeFileSync(exitFile, '{"exitCo');
+
+      assert.equal(readExitSidecar({ sessionFile, exitFile }), null);
+      assert.ok(existsSync(exitFile), "expected the unparsable sidecar to survive");
+
+      writeFileSync(exitFile, JSON.stringify({ exitCode: 2 }));
+      assert.deepEqual(readExitSidecar({ sessionFile, exitFile }), {
+        reason: "done",
+        exitCode: 2,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still honours the legacy session-scoped sidecar", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-exit-sidecar-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: "boom" }));
+
+      assert.deepEqual(readExitSidecar({ sessionFile }), {
+        reason: "error",
+        exitCode: 1,
+        errorMessage: "boom",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("subagent exit sidecar wiring", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("scopes the sidecar to the subagent id so a resume cannot see a stale file", () => {
+    const a = testApi.subagentExitFile("/tmp/s.jsonl", "aaaa1111");
+    const b = testApi.subagentExitFile("/tmp/s.jsonl", "bbbb2222");
+    assert.equal(a, "/tmp/s.jsonl.exit.aaaa1111");
+    assert.notEqual(a, b);
+  });
+
+  it("writes an atomically-renamed payload carrying the child exit code", () => {
+    const snippet = testApi.exitSidecarShellSnippet("/tmp/dir with space/s.jsonl", "id1", "piExit");
+    assert.match(snippet, /printf '\{"exitCode":%s\}' "\$piExit"/);
+    assert.match(snippet, /> '\/tmp\/dir with space\/s\.jsonl\.exit\.id1\.tmp'/);
+    assert.match(snippet, /mv -f '[^']*\.tmp' '\/tmp\/dir with space\/s\.jsonl\.exit\.id1'/);
+  });
+
+  it("clears a stale sidecar before a launch", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-exit-clear-"));
+    try {
+      const exitFile = join(dir, "s.jsonl.exit.id2");
+      writeFileSync(exitFile, JSON.stringify({ exitCode: 0 }));
+      writeFileSync(`${exitFile}.tmp`, "x");
+
+      testApi.clearExitSidecar(exitFile);
+
+      assert.ok(!existsSync(exitFile));
+      assert.ok(!existsSync(`${exitFile}.tmp`));
+      // Idempotent: nothing to clear is not an error.
+      testApi.clearExitSidecar(exitFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
@@ -1810,6 +1997,84 @@ describe("commands", () => {
     (subagentsModule as any).default(api);
     assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
     assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+  });
+});
+
+describe("deliverPendingAttention", () => {
+  it("notifies the orchestrator once that a provider error left the run open", () => {
+    const { api, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const testApi = (subagentsModule as any).__test__;
+
+    const dir = createTestDir();
+    try {
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", version: 3, id: "sess-1", parentId: undefined },
+      ]);
+      // A parked subagent that died on a provider error writes this sidecar; the
+      // run itself stays alive (unlike the old `.exit` failure path).
+      const attentionFile = `${sessionFile}.attention`;
+      writeFileSync(
+        attentionFile,
+        JSON.stringify({ type: "provider-error", errorMessage: "connection reset by peer" }),
+      );
+
+      const running = {
+        id: "abc123",
+        name: "Scout",
+        task: "look around",
+        agent: "scout",
+        surface: "%1",
+        startTime: Date.now() - 42_000,
+        sessionFile,
+      };
+
+      testApi.deliverPendingAttention(running);
+
+      const attention = sentMessages.filter((m) => m.message.customType === "subagent_attention");
+      assert.equal(attention.length, 1, "expected exactly one attention message");
+      assert.match(attention[0].message.content, /provider\/connection error/);
+      assert.match(attention[0].message.content, /connection reset by peer/);
+      assert.match(attention[0].message.content, /still open/);
+      assert.match(attention[0].message.content, /subagent_message\(\{ name: "Scout"/);
+      assert.equal(attention[0].message.details.errorMessage, "connection reset by peer");
+      assert.equal(attention[0].options.deliverAs, "steer");
+      // The signal was consumed, not treated as an exit.
+      assert.equal(existsSync(attentionFile), false);
+
+      // Second tick must not re-notify the orchestrator.
+      testApi.deliverPendingAttention(running);
+      assert.equal(
+        sentMessages.filter((m) => m.message.customType === "subagent_attention").length,
+        1,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays quiet without a sidecar", () => {
+    const { api, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const testApi = (subagentsModule as any).__test__;
+
+    const dir = createTestDir();
+    try {
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", version: 3, id: "sess-2", parentId: undefined },
+      ]);
+      testApi.deliverPendingAttention({
+        id: "def456",
+        name: "Worker",
+        task: "t",
+        surface: "%2",
+        startTime: Date.now(),
+        sessionFile,
+      });
+      assert.equal(sentMessages.length, 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1858,10 +2123,12 @@ describe("tool registration", () => {
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const props = subagentTool.parameters.properties;
+    // LOCAL PATCH: `model` is intentionally absent from the schema (per-spawn
+    // model overrides are disabled; the agent's frontmatter model wins).
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "cwd", "name", "task"],
+      "only agent/task/name/cwd should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -2373,9 +2640,9 @@ describe("subagent interruption", () => {
       "Worker",
     );
 
-    assert.match(presentation, /Sub-agent "Worker" failed/);
-    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /Sub-agent "Worker" failed after/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(presentation, /did not produce a usable result/);
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);

@@ -19,6 +19,8 @@ Spawn several in parallel — they run concurrently and steer results back indep
 
 Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
 
+**How completion is detected.** The authoritative signal is an exit sidecar file: the launch script records the child's raw exit status as `{"exitCode":N}` in `subagentExitFile()`'s path (`<session>.exit.<id>`, written atomically) the moment the process ends — clean exit, crash, or kill. The parent polls that file. Do not make the parent depend on reading the pane: everything on screen is wrapped to the pane width, so in a pane narrower than 19 columns the `__SUBAGENT_DONE_<code>__` marker is split across two rows, and any resize re-wraps rows that were already printed. The on-screen marker (`capture-pane -J`), the Claude sentinel file and a legacy `<session>.exit` sidecar remain only as fallbacks. A run whose pane disappears without a sidecar is reported as a failure after `MAX_CAPTURE_FAILURES` unreadable ticks instead of polling forever.
+
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
 ```bash
@@ -133,6 +135,7 @@ Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
 - **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
+- **A provider/connection error does not close the run.** When auto-retry is exhausted the turn ends with `stopReason: error`; instead of shutting down, the sub-agent parks as `waiting` — exactly like a normal pi session left with an error in the transcript — and the parent is notified once (`provider error, still running`). Reply with `subagent_message({ name, message: "Continue." })` to let it retry in place; nothing is lost if you don't.
 
 ### interactive
 
