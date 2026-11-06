@@ -105,10 +105,10 @@ const SubagentParams = Type.Object({
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  // LOCAL PATCH: per-spawn model overrides are disabled. An agent's model comes
-  // only from its own frontmatter; a parent silently overriding it (e.g. to an
-  // expensive model for a trivial task) is not allowed. To re-enable, uncomment
-  // the line below and restore `params.model ??` in launchSubagent().
+  // LOCAL PATCH: per-spawn model overrides are disabled. A subagent always runs
+  // on the spawning session's own model (see launchSubagent()), so neither the
+  // parent nor the agent definition can pin a different one. To re-enable,
+  // uncomment the line below and restore `params.model ??` in launchSubagent().
   // model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
   cwd: Type.Optional(
     Type.String({
@@ -1217,6 +1217,20 @@ function clearExitSidecar(exitFile: string): void {
 }
 
 /**
+ * Resolve the model of the session that is spawning a subagent into the
+ * `provider/model-id` form `pi --model` accepts (the same form used by
+ * `enabledModels` / `defaultModel` in settings).
+ *
+ * Returns undefined when the spawning session has no model bound, in which case
+ * callers fall back to their pre-existing behaviour.
+ */
+function creatorModelId(ctx: { model?: { provider: string; id: string } | undefined }): string | undefined {
+  const model = ctx.model;
+  if (!model?.provider || !model.id) return undefined;
+  return `${model.provider}/${model.id}`;
+}
+
+/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -1224,16 +1238,24 @@ function clearExitSidecar(exitFile: string): void {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    cwd: string;
+    model?: { provider: string; id: string } | undefined;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  // LOCAL PATCH: no per-spawn model override — the agent's frontmatter model is
-  // authoritative (`model` was removed from the `subagent` tool schema).
-  const effectiveModel = agentDefs?.model;
+  // LOCAL PATCH: subagents inherit the model of the session that spawns them
+  // ("same model as the creator") instead of a preconfigured per-agent model.
+  // An agent frontmatter `model:` is therefore ignored whenever the spawning
+  // session has a model — it only acts as a last-resort fallback for callers
+  // that run without one. Per-spawn overrides stay disabled: `model` is not in
+  // the `subagent` tool schema.
+  const effectiveModel = creatorModelId(ctx) ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1316,8 +1338,10 @@ async function launchSubagent(
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+    // Claude Code uses its own model names, so it keeps whatever the agent's
+    // frontmatter declares — a pi provider/model id would not resolve here.
+    if (agentDefs.model) {
+      cmdParts.push("--model", shellEscape(agentDefs.model));
     }
 
     const sp = agentDefs.body;
@@ -1400,6 +1424,7 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
+    // Snapshot of the creator's model at spawn time, replayed on resume.
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
