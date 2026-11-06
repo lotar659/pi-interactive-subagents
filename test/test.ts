@@ -1818,6 +1818,130 @@ describe("subagent-done.ts", () => {
       }
     });
   });
+
+  describe("provider-error attention signal", () => {
+    // pi emits `agent_end` for EVERY attempt, including attempts it is about to
+    // auto-retry (a retry calls `agent.continue()`, which emits a fresh
+    // `agent_start`). Only `agent_settled` means the run is really over, so the
+    // `.attention` sidecar must be written there — not from the `agent_end`
+    // handler. These tests pin that lifecycle down.
+    function setupAttentionExtension(sessionFile: string) {
+      const handlers = new Map<string, Array<(...args: any[]) => void>>();
+      const api = {
+        on(event: string, handler: (...args: any[]) => void) {
+          if (!handlers.has(event)) handlers.set(event, []);
+          handlers.get(event)!.push(handler);
+        },
+        registerTool() {}, registerCommand() {}, registerMessageRenderer() {},
+        registerShortcut() {}, sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
+      } as any;
+      const saved = {
+        session: process.env.PI_SUBAGENT_SESSION,
+        name: process.env.PI_SUBAGENT_NAME,
+        agent: process.env.PI_SUBAGENT_AGENT,
+        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+      };
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      process.env.PI_SUBAGENT_NAME = "scout-2";
+      process.env.PI_SUBAGENT_AGENT = "scout";
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      subagentDoneExtension(api);
+      const emit = (event: string, ...args: any[]) =>
+        (handlers.get(event) ?? []).forEach((h) => h(...args));
+      const restore = () => {
+        restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+        restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
+        restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+      };
+      return { emit, restore };
+    }
+
+    const failedTurn = [
+      { role: "assistant", stopReason: "error", errorMessage: "connection reset by peer" },
+    ];
+    const cleanTurn = [{ role: "assistant", stopReason: "stop", content: [] }];
+    const inertCtx = { shutdown() {} };
+    const attentionPath = (sessionFile: string) => `${sessionFile}.attention`;
+
+    it("does not write .attention from agent_end while pi may still retry", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupAttentionExtension(sessionFile);
+      try {
+        emit("agent_start");
+        emit("agent_end", { messages: failedTurn }, inertCtx);
+        assert.equal(
+          existsSync(attentionPath(sessionFile)),
+          false,
+          "the first failed attempt must not wake the parent — pi retries it",
+        );
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("writes .attention once the run settles with the error still pending", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupAttentionExtension(sessionFile);
+      try {
+        emit("agent_start");
+        emit("agent_end", { messages: failedTurn }, inertCtx);
+        emit("agent_settled", { aborted: false });
+        const file = attentionPath(sessionFile);
+        assert.ok(existsSync(file), "retries exhausted → parent must be notified");
+        const payload = JSON.parse(readFileSync(file, "utf-8"));
+        assert.equal(payload.type, "provider-error");
+        assert.equal(payload.errorMessage, "connection reset by peer");
+        assert.equal(payload.stopReason, "error");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("clears the pending error when an automatic retry starts", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupAttentionExtension(sessionFile);
+      try {
+        emit("agent_start");
+        emit("agent_end", { messages: failedTurn }, inertCtx); // attempt 1 fails
+        emit("agent_start"); // pi retries
+        emit("agent_end", { messages: cleanTurn }, inertCtx); // retry succeeds
+        emit("agent_settled", { aborted: false });
+        assert.equal(
+          existsSync(attentionPath(sessionFile)),
+          false,
+          "a recovered retry must not leave a stale attention signal",
+        );
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write .attention when the parent aborts during a retry", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupAttentionExtension(sessionFile);
+      try {
+        emit("agent_start");
+        emit("agent_end", { messages: failedTurn }, inertCtx);
+        emit("agent_settled", { aborted: true });
+        assert.equal(
+          existsSync(attentionPath(sessionFile)),
+          false,
+          "a deliberate abort is not a provider failure",
+        );
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 describe("tmux.ts interpretExitSidecar", () => {

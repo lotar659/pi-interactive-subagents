@@ -18,6 +18,11 @@
  * therefore suppressed for that turn as well: the subagent parks in "waiting",
  * writes a `${sessionFile}.attention` signal, and the parent can steer a retry
  * into the live session instead of resuming it from a cold start.
+ *
+ * `agent_end` fires for EVERY attempt, including the ones pi is about to retry
+ * automatically (a retry continues the run and emits a fresh `agent_start`).
+ * The `.attention` signal is therefore only written on `agent_settled`, which
+ * fires once after the whole run — retries included — has finished.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
@@ -90,8 +95,9 @@ export type AgentEndAction =
  *  - a provider/connection error on the last turn (auto-retry exhausted). pi
  *    itself leaves an interactive session open after such an error, with the
  *    error in the transcript and the next message continuing the conversation —
- *    a subagent must behave the same way instead of closing itself. The parent
- *    is told once via the `.attention` sidecar and can steer a retry in.
+ *    a subagent must behave the same way instead of closing itself. Once the
+ *    whole run settles (retries included), the parent is told once via the
+ *    `.attention` sidecar and can steer a retry in.
  */
 export function resolveAgentEndAction(params: {
   autoExit: boolean;
@@ -214,6 +220,13 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+
+  // Provider error from the latest turn, recorded at `agent_end` and promoted to
+  // a terminal failure only at `agent_settled`. A new turn — including pi's
+  // automatic retry, which emits `agent_start` — clears it again, so the parent
+  // is never woken for a blip the child recovers from on its own.
+  let pendingProviderError: SubagentErrorInfo | null = null;
+
   // Set when ask_question is called; suppresses auto-exit so the session stays
   // open while it waits for the orchestrator's reply. Cleared when the reply
   // lands — on `input` (covers a reply steered into the current run) and on
@@ -256,11 +269,18 @@ export default function (pi: ExtensionAPI) {
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
     awaitingAnswer = false;
+    // A retry is an `agent_start` too: the previous attempt's error is not
+    // terminal, so do not let it reach `agent_settled`.
+    pendingProviderError = null;
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
+    // `agent_end` fires once per attempt, BEFORE pi decides whether to retry it
+    // (`auto_retry_start` + another `agent_start`). Record the error here; only
+    // `agent_settled` can tell whether the retries are actually exhausted.
+    pendingProviderError = findLatestAssistantError(messages);
     const hasPendingChildren = runningChildrenCount() > 0;
     const action = resolveAgentEndAction({
       autoExit,
@@ -275,37 +295,46 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Parked: keep the session (and its pane) open for a later turn. When the
-    // reason is a provider/connection error, drop an `.attention` sidecar so the
-    // parent's watcher learns about it once and can steer a retry into this live
-    // session — the same thing a human does in a normal pi session after an
-    // error. Auto-exit is still decided per turn, so a later turn that completes
-    // cleanly closes the session normally.
+    // Parked: keep the session (and its pane) open for a later turn. The
+    // `.attention` sidecar is written from `agent_settled`, not here, so an
+    // attempt pi is about to retry does not wake the parent. Auto-exit is still
+    // decided per turn, so a later turn that completes cleanly closes the
+    // session normally.
     if (autoExit) {
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.attention`,
-            JSON.stringify({
-              type: "provider-error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — without the sidecar the parent still sees the run
-          // sitting in the widget's "waiting" phase and can steer it.
-        }
-      }
-
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
 
     recorder.agentEndWaiting();
+  });
+
+  pi.on("agent_settled", (event) => {
+    // The run is over for good — pi will not retry it. If the last attempt still
+    // ended on a provider/connection error, the child is parked on a real
+    // failure: drop an `.attention` sidecar so the parent's watcher notifies the
+    // orchestrator once and can steer a retry into this live session — the same
+    // thing a human does in a normal pi session after an error.
+    const errorInfo = pendingProviderError;
+    pendingProviderError = null;
+    if (!errorInfo || !autoExit) return;
+    // Escape/abort during a retry sleep is a deliberate stop, not a failure.
+    if ((event as any).aborted) return;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    try {
+      writeFileSync(
+        `${sessionFile}.attention`,
+        JSON.stringify({
+          type: "provider-error",
+          errorMessage: errorInfo.errorMessage,
+          stopReason: errorInfo.stopReason,
+        }),
+      );
+    } catch {
+      // Best effort — without the sidecar the parent still sees the run
+      // sitting in the widget's "waiting" phase and can steer it.
+    }
   });
 
   pi.on("turn_start", (event) => {
