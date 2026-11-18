@@ -55,6 +55,7 @@ import {
   resolveAgentEndAction,
   findLatestAssistantError,
   runningChildrenCount,
+  resolveSubagentWidgetLabel,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
@@ -1471,6 +1472,27 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  describe("resolveSubagentWidgetLabel", () => {
+    it("puts the spawn name first and the agent role after it", () => {
+      assert.deepEqual(resolveSubagentWidgetLabel("Worker", "scout"), {
+        name: "Worker",
+        role: "scout",
+      });
+    });
+
+    it("drops the role when the spawn name already is the role", () => {
+      assert.deepEqual(resolveSubagentWidgetLabel("scout", "scout"), { name: "scout", role: "" });
+    });
+
+    it("labels an unnamed spawn with its role and an agentless spawn with its name", () => {
+      assert.deepEqual(resolveSubagentWidgetLabel("", "scout"), { name: "scout", role: "" });
+      assert.deepEqual(resolveSubagentWidgetLabel("Worker", ""), { name: "Worker", role: "" });
+    });
+
+    it("labels nothing when neither env var is set", () => {
+      assert.deepEqual(resolveSubagentWidgetLabel(undefined, undefined), { name: "", role: "" });
+    });
+  });
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);

@@ -35,6 +35,23 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
 }
 
 /**
+ * Widget identity for the pane: the spawn name first, because that is the
+ * handle the orchestrator uses in `subagent_message({ name })`, and the agent
+ * role after it. Several panes can share one role, and the role alone leaves
+ * them indistinguishable; the name alone hides what kind of agent is running.
+ */
+export function resolveSubagentWidgetLabel(
+  name: string | undefined,
+  agent: string | undefined,
+): { name: string; role: string } {
+  const spawnName = (name ?? "").trim();
+  const agentName = (agent ?? "").trim();
+  const primary = spawnName || agentName;
+  const role = agentName && agentName.toLowerCase() !== primary.toLowerCase() ? agentName : "";
+  return { name: primary, role };
+}
+
+/**
  * Number of child subagents this session itself still has in flight.
  *
  * When this extension is loaded inside a subagent that can spawn its own
@@ -173,8 +190,12 @@ export default function (pi: ExtensionAPI) {
       (_tui: any, theme: any) => {
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
 
-        const label = subagentAgent || subagentName;
-        const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
+        const label = resolveSubagentWidgetLabel(subagentName, subagentAgent);
+        const agentTag = label.name
+          ? `${theme.fg("accent", "[")}${theme.bold(theme.fg("accent", label.name))}${
+              label.role ? theme.fg("dim", ` · ${label.role}`) : ""
+            }${theme.fg("accent", "]")}`
+          : "";
 
         if (expanded) {
           // Expanded: full tool list + denied
