@@ -473,6 +473,28 @@ function formatUsageSegments(stats: SessionStats): string[] {
   return segs;
 }
 
+/** Exact token count with thousands separators: 112,400. */
+function formatExactTokens(n: number): string {
+  return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/**
+ * Usage summary carried in the completion message the orchestrator reads — not
+ * only in the widget. Context occupancy is printed exactly, because it is the
+ * number compared against a task's token budget when deciding whether a fix
+ * goes back to the same subagent or to a fresh one.
+ */
+function formatUsageLine(stats: SessionStats): string {
+  const parts: string[] = [];
+  if (stats.inputTokens) parts.push(`${formatTokens(stats.inputTokens)} in`);
+  if (stats.outputTokens) parts.push(`${formatTokens(stats.outputTokens)} out`);
+  if (stats.cacheReadTokens) parts.push(`${formatTokens(stats.cacheReadTokens)} cache read`);
+  if (stats.cacheWriteTokens) parts.push(`${formatTokens(stats.cacheWriteTokens)} cache write`);
+  if (stats.cost) parts.push(`$${stats.cost.toFixed(2)}`);
+  if (stats.contextTokens > 0) parts.push(`context ${formatExactTokens(stats.contextTokens)} tokens`);
+  return parts.join(" · ");
+}
+
 /** ANSI colors for widget status icons (raw, since the widget bypasses theme). */
 const ICON_GREEN = "\x1b[38;2;126;186;103m";
 const ICON_YELLOW = "\x1b[38;2;214;181;94m";
@@ -553,13 +575,15 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "stats"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  const usageLine = result.stats ? formatUsageLine(result.stats) : "";
+  const usage = usageLine ? `\n\nUsage: ${usageLine}` : "";
 
   if (result.errorMessage) {
     // The run did not produce a usable result. Two sources: a legacy/stale
@@ -573,13 +597,13 @@ function resolveResultPresentation(
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)}.\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a usable result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_message.${sessionRef}`
+      `subagent or resume the session with subagent_message.${usage}${sessionRef}`
     );
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${usage}${sessionRef}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${usage}${sessionRef}`;
 }
 
 /**
@@ -1159,6 +1183,8 @@ export const __test__ = {
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
+  formatUsageLine,
+  formatExactTokens,
   widgetIcon,
 };
 
@@ -2442,6 +2468,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.stats ? { stats: result.stats } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2560,6 +2587,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // wording change cannot leave the header duplicated inside the box.
         const summary = rawContent
           .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
+          .replace(/\n\nUsage: [^\n]*$/, "")
           .replace(
             new RegExp(
               `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" (?:completed|failed)[^\\n]*\\n\\n`,

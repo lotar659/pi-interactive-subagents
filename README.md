@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn. The completion message carries the run's usage — `Usage: 98k in · 7.0k out · 210k cache read · $1.23 · context 213,500 tokens` — so the orchestrator can weigh a follow-up fix against the token budget it was given for the task.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮

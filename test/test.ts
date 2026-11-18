@@ -2743,6 +2743,38 @@ describe("subagent interruption", () => {
     // Follow-ups reference the name (not the session id).
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
+    assert.doesNotMatch(presentation, /Usage:/);
+  });
+
+  it("carries the session usage into the message the orchestrator reads", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 0,
+        elapsed: 240,
+        summary: "Refactored the parser.",
+        sessionFile: "/tmp/subagent.jsonl",
+        sessionId: "019f-abc",
+        stats: {
+          model: "claude-sonnet-4-6",
+          toolCount: 42,
+          inputTokens: 98_000,
+          outputTokens: 7000,
+          cacheReadTokens: 210_000,
+          cacheWriteTokens: 0,
+          contextTokens: 213_500,
+          cost: 1.234,
+        },
+      },
+      "Worker",
+    );
+
+    assert.match(
+      presentation,
+      /Usage: 98k in · 7.0k out · 210k cache read · \$1\.23 · context 213,500 tokens/,
+    );
+    // Usage sits between the summary and the follow-up handle.
+    assert.ok(presentation.indexOf("Usage:") < presentation.indexOf("Follow up with"));
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -2770,6 +2802,33 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+
+  it("reports the usage of a failed run as well", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 61,
+        summary: "tests failed",
+        sessionFile: "/tmp/subagent.jsonl",
+        sessionId: "019f-abc",
+        stats: {
+          model: "claude-sonnet-4-6",
+          toolCount: 9,
+          inputTokens: 40_000,
+          outputTokens: 2000,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          contextTokens: 88_000,
+          cost: 0.5,
+        },
+      },
+      "Worker",
+    );
+
+    assert.match(presentation, /failed \(exit code 1\)/);
+    assert.match(presentation, /context 88,000 tokens/);
   });
 });
 
@@ -2820,6 +2879,48 @@ describe("subagent status renderer", () => {
       assert.match(output, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
     assert.match(output, /\+2 more running\./);
+  });
+
+  it("shows the usage gauge once, not the plain-text line meant for the model", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const rendererEntry = registeredMessageRenderers.find(
+      (entry) => entry.name === "subagent_result",
+    );
+    assert.ok(rendererEntry, "expected subagent_result renderer to be registered");
+
+    const stats = {
+      model: "claude-sonnet-4-6",
+      toolCount: 42,
+      inputTokens: 98_000,
+      outputTokens: 7000,
+      cacheReadTokens: 210_000,
+      cacheWriteTokens: 0,
+      contextTokens: 112_400,
+      cost: 1.234,
+    };
+    const content = (subagentsModule as any).__test__.resolveResultPresentation(
+      {
+        exitCode: 0,
+        elapsed: 240,
+        summary: "Refactored the parser.",
+        sessionFile: "/tmp/subagent.jsonl",
+        sessionId: "019f-abc",
+        stats,
+      },
+      "Worker",
+    );
+
+    const rendered = rendererEntry.renderer(
+      { customType: "subagent_result", content, details: { name: "Worker", exitCode: 0, elapsed: 240, stats } },
+      { expanded: true },
+      createTheme(),
+    );
+    const output = rendered.render(120).join("\n");
+
+    assert.doesNotMatch(output, /Usage:/);
+    assert.match(output, /56\.2%\/200k/);
   });
 
   it("stays within narrow widths", () => {
@@ -3027,6 +3128,48 @@ describe("subagent display helpers", () => {
           cost: 0,
         }),
         [],
+      );
+    });
+  });
+
+  describe("formatExactTokens", () => {
+    it("groups thousands so a context figure reads exactly", () => {
+      assert.equal(testApi.formatExactTokens(850), "850");
+      assert.equal(testApi.formatExactTokens(112_400), "112,400");
+      assert.equal(testApi.formatExactTokens(1_049_512), "1,049,512");
+    });
+  });
+
+  describe("formatUsageLine", () => {
+    it("summarizes in/out, cache, cost and the exact end-of-run context", () => {
+      assert.equal(
+        testApi.formatUsageLine({
+          model: "claude-sonnet-4-6",
+          toolCount: 3,
+          inputTokens: 3200,
+          outputTokens: 890,
+          cacheReadTokens: 45_000,
+          cacheWriteTokens: 0,
+          contextTokens: 112_400,
+          cost: 0.042,
+        }),
+        "3.2k in · 890 out · 45k cache read · $0.04 · context 112,400 tokens",
+      );
+    });
+
+    it("prints nothing when the session recorded no usage", () => {
+      assert.equal(
+        testApi.formatUsageLine({
+          model: null,
+          toolCount: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          contextTokens: 0,
+          cost: 0,
+        }),
+        "",
       );
     });
   });
